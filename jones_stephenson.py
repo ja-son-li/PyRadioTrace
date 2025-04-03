@@ -1,81 +1,126 @@
 import numpy as np
 from models import GeoModel
 import scipy.constants as const
-from scipy.integrate import odeint 
+from scipy.integrate import odeint, solve_ivp 
 from numba import jit
 import scipy.optimize
 
 class Raytracer():
 
-    def __init__(self, iono, magneto, neutral, **kwargs):
+    def __init__(self, iono = None, magneto = None, neutral = None, o_mode = True):
+        """"
+
+
+        state space is [1. r : spherical coordinate radius (m), 
+                        2. theta : spherical coordinate longitude (rad), 
+                        3. phi : spherical coordinate colatitude (rad),
+                        4. kr, (m/m)
+                        5. ktheta, (m/m)
+                        6. kphi : spherical coordinate wave normal  (m/m)
+                        7. P : total phase (m), 
+                        8. s: geometric path length (m)]
+        
+        kr ktheta kphi are normalized such that kr**2 + ktheta**2 + kphi**2 = omega**2/c**2 where omega = 2*pi*f
+        """
         self.iono = iono
         self.magneto = magneto
         self.neutral = neutral
-        self.c = const.speed_of_light
-    
-        # state space is [1. r : spherical coordinate radius (m), 
-        #                 2. theta : spherical coordinate longitude (rad), 
-        #                 3. phi : spherical coordinate colatitude (rad),
-        #                 4. kr, 
-        #                 5. ktheta, 
-        #                 6. kphi : spherical coordinate wave normal  
-        #                 7. P : path length (m), 
-        #                 8. s: geometric path length (m)]
-        # 
-        # kr ktheta kphi are normalized such that kr**2 + ktheta**2 + kphi**2 = omega**2/c**2
 
-    def ray_home(self, transmit_lat, transmit_lon, transmit_alt, receive_lat, receive_lon, receive_alt, f, hmin = 1, resolution_m = 5, resolution_angle_deg = 0.1):
+    def ray_home(self, transmit_lat:np.float64, 
+                transmit_lon:np.float64,
+                transmit_alt:np.float64,
+                receive_lat:np.float64, 
+                receive_lon:np.float64, 
+                receive_alt:np.float64, 
+                f : np.float64, 
+                resolution_m:np.float64 = 0.01,
+                resolution_angle_deg:np.float64 = 1e-3, 
+                rtol = 1e-3, 
+                atol = 1e-6) -> scipy.optimize.OptimizeResult:
         """
-        
+        transmit_lat : latitude of transmitter (deg)
+        transmit_lon : longitude of transmitter (deg)
+        transmit_alt : altitude of transmitter (m)
+        receive_lat : latitude of receiver (deg)
+        receive_lon : longitude of receiver (deg)
+        receive_alt : altitude of receiver (m)
+        f : frequency (Hz)
+        hmin : minimum step size of ODE solver (m)
+        resolution_m : minimum interation difference for cost function(m)
+        resolution_angle_deg : minimum interation difference azimuth and elevation (deg)
         """
-
-        # convert geodetic coordinates to spherical coordinates
-        x, y, z = GeoModel.convert_lla_to_ecef(transmit_lat, transmit_lon, transmit_alt)
-        r, theta, phi = GeoModel.convert_ecef_to_spherical(x, y, z)
-
-
-        # convert az, el look angle to spherical vectors 
-        omega = 2*np.pi*f
         
         # first guess 
         az, el, range_val = GeoModel.geodetic2aer(transmit_lat, transmit_lon, transmit_alt, receive_lat, receive_lon, receive_alt)
-        group_path_distances = np.arange(0,range_val+1e3, resolution_m)
-        initial_guess = [az, el]
-        #optimize 
-        optimize_func = lambda az_el_list : self.ray_distance_to_target(transmit_lat, transmit_lon, transmit_alt, 
-                                                                                receive_lat, receive_lon, receive_alt, 
-                                                                                az_el_list[0], az_el_list[1], f,  group_path_distances=group_path_distances, hmin = hmin)
-        
-        # nelder mead simplex optimization for minimum distance 
-        minimum = scipy.optimize.fmin(optimize_func, initial_guess,  xtol=resolution_angle_deg, ftol=resolution_m, disp=True)
+        group_path_distances = np.arange(range_val-10e3,range_val+10e3, resolution_m/2)
 
-        return minimum
-     
-    def ray_distance_to_target(self, transmit_lat, transmit_lon, transmit_alt, 
-                               receiver_lat, receiver_lon, receiver_alt,
-                                az, el, f, group_path_distances=np.arange(0,2000,5), hmin = 100):
+        # initial guess is straight line of sight pointing 
+        initial_guess = [el]
+
+        # minimization function
+        def optimization_function(azel_guess:tuple[float]) -> float:
+            return self.ray_distance_to_target(transmit_lat, transmit_lon, transmit_alt, 
+                                                receive_lat, receive_lon, receive_alt, 
+                                                az, azel_guess[0], f, 
+                                                group_path_distances=group_path_distances, 
+                                                rtol=rtol, atol=atol)
+        # initial_simplex = np.array([[initial_guess[0], initial_guess[1]],
+        #                             [initial_guess[0], initial_guess[1] + resolution_angle_deg],
+        #                             [initial_guess[0], initial_guess[1] - resolution_angle_deg]])
         
-        solution = self.ray_propagate(transmit_lat, transmit_lon, transmit_alt, az, el, f, group_path_distances, hmin)
+        result = scipy.optimize.minimize(optimization_function, initial_guess, method='Nelder-Mead', options={'fatol': resolution_m, 
+                                                                                                              'maxiter':1e3,
+                                                                                                              'disp': True})
+        # result = scipy.optimize.minimize(optimization_function, initial_guess, method='Nelder-Mead')
+        # result = scipy.optimize.minimize(optimization_function, initial_guess)
+
+        # minimum = (result.x, result.fun, result.success, result.message)
+        # nelder mead simplex optimization for minimum distance 
+        # result = scipy.optimize.fmin(optimization_function, initial_guess,  xtol=resolution_angle_deg, ftol=resolution_m, disp=True)
+
+        return result
+     
+    def ray_distance_to_target(self, transmit_lat:np.float64, transmit_lon:np.float64, transmit_alt:np.float64, 
+                                    receiver_lat:np.float64, receiver_lon:np.float64, receiver_alt:np.float64,
+                                    az:np.float64, el:np.float64, f:np.float64, 
+                                    group_path_distances:np.ndarray = np.arange(0,2000,5), rtol = 1e-3, atol = 1e-6) -> np.float64:
+        """
+        INPUT:
+        transmit_lat : latitude of transmitter (deg)
+        transmit_lon : longitude of transmitter (deg)
+        transmit_alt : altitude of transmitter (m)
+        receiver_lat : latitude of receiver (deg)
+        receiver_lon : longitude of receiver (deg)
+        receiver_alt : altitude of receiver (m)
+        az : azimuth of look direction (deg)
+        el : elevation off horizon (deg)
+        f : frequency (Hz)
+
+        OUTPUT:
+        Minimum distance of ray to target (m)
+        """
+        solution = self.ray_propagate(transmit_lat, transmit_lon, transmit_alt, az, el, f, group_path_distances = group_path_distances, atol = atol, rtol = rtol)
 
         # convert geodetic coordinates to spherical coordinates
         x, y, z = GeoModel.convert_lla_to_ecef(receiver_lat, receiver_lon, receiver_alt)
         r_rx, theta_rx, phi_rx = GeoModel.convert_ecef_to_spherical(x, y, z)
-        distances = self.distance_between_two_spherical_vectors(solution[:,0], solution[:,1], solution[:,2], r_rx, theta_rx, phi_rx)
 
-        return np.min(distances) 
-    
-    @staticmethod
-    def distance_between_two_spherical_vectors(r1, theta1, phi1, r2, theta2, phi2):
-        """
-        Calculate the distance between two spherical vectors.
-        """
+        distances = GeoModel.distance_between_two_spherical_vectors(solution.y[0,:], solution.y[1,:], solution.y[2,:], r_rx, theta_rx, phi_rx)
 
-        return np.sqrt( r1**2 + r2**2 
-                       - 2*r1*r2*(np.sin(theta1)*np.sin(theta2)*np.cos(phi1-phi2)) 
-                       + np.cos(theta1)*np.cos(theta2))
-    
+        min_distance = np.nanmin(distances)
+        print(min_distance)
+        return min_distance
 
-    def ray_propagate(self, transmit_lat, transmit_lon, transmit_alt, az, el, f, group_path_distances=np.arange(0,2000,5), hmin = 100):
+
+    def ray_propagate(self, transmit_lat: np.float64, 
+                            transmit_lon: np.float64,
+                            transmit_alt: np.float64, 
+                            az: np.float64,
+                            el: np.float64,
+                            f : np.float64,
+                            group_path_distances:np.ndarray = np.arange(0,2000,5),
+                            rtol: np.float64 = 1e-3,
+                            atol: np.float64 = 1e-6):
         """
         Propagate a ray from the transmitter to a look direction
         transmit_lat : latitude of transmitter (deg)
@@ -94,106 +139,91 @@ class Raytracer():
         omega = 2*np.pi*f
         
         # renormalize the propagation vector 
-        kr, ktheta, kphi = self.azel_to_spherical_vector(transmit_lat, transmit_lon, transmit_alt, az, el)
+        kr, ktheta, kphi = GeoModel.azel_to_spherical_vector(transmit_lat, transmit_lon, transmit_alt, az, el)
         norm = np.sqrt(kr**2 + ktheta**2 + kphi**2)
         kr = kr/norm * omega/const.c
         ktheta = ktheta/norm *omega/const.c
         kphi = kphi/norm *omega/const.c
 
+        # initalize state vector
         x0 = [r, theta, phi, kr, ktheta, kphi, 0,0]
 
-        solution = odeint(self.derivatives_neutral, x0, group_path_distances, args=(f,), rtol=1e-6, atol=1e-6, hmin =hmin)
+        # if self.neutral is not None and self.iono is not None:
+        #     solution = odeint(self.derivatives, x0, group_path_distances, args=(f,), rtol=rtol, atol=atol, hmin =hmin)
+        # elif self.neutral is not None:
+        #     solution = odeint(self.derivatives_neutral, x0, group_path_distances, args=(f,), rtol=rtol, atol=atol, hmin =hmin)
+        # elif self.iono is not None:
+        #     solution = odeint(self.derivatives_ionosphere, x0, group_path_distances, args=(f,), rtol=rtol, atol=atol, hmin =hmin)
+
+        t_span = [0, np.max(group_path_distances)]
+
+        if self.neutral is not None and self.iono is not None:
+            solution = solve_ivp(self.derivatives, t_span, x0, t_eval = group_path_distances, args=(f,), rtol = rtol, atol = atol)
+            # solution = solve_ivp(self.derivatives, t_span, x0, t_eval = group_path_distances, args=(f,))
+
+        # elif self.neutral is not None:
+        #     solution = odeint(self.derivatives_neutral, x0, group_path_distances, args=(f,), rtol=rtol, atol=atol, hmin =hmin)
+        # elif self.iono is not None:
+        #     solution = odeint(self.derivatives_ionosphere, x0, group_path_distances, args=(f,), rtol=rtol, atol=atol, hmin =hmin)
 
         return solution
     
-    @staticmethod
-    def azel_to_spherical_vector(lat, lon, alt, az, el):
+    def derivatives_neutral(self, Pgroup:np.float64, x:tuple[np.float64], f:np.float64):
         """
-        lat : latitude (deg)
-        lon : longitude (deg)
-        alt : altitude (m)
-        az : azimuth East of North (deg) 
-        el : elevation off horizon (deg)
+        x : state vector
+        Pgroup : group path length (m)
+        f : frequency (Hz)
         """
-        
-        x, y, z = GeoModel.convert_lla_to_ecef(lat, lon, alt)
-        r, theta, phi = GeoModel.convert_ecef_to_spherical(x, y, z)
-            
-        # convert observer location to ECEF 
-        X_plus, Y_plus, Z_plus =GeoModel.aer_to_ecef(lat, lon, alt, az, el, 1)
-
-        delta_X = X_plus - x
-        delta_Y = Y_plus - y
-        delta_Z = Z_plus - z
-
-        delta_r = np.sin(theta)*np.cos(phi)*delta_X + np.sin(theta)*np.sin(phi)*delta_Y + np.cos(theta)*delta_Z
-        delta_theta = np.cos(theta)*np.cos(phi)*delta_X + np.cos(theta)*np.sin(phi)*delta_Y - np.sin(theta)*delta_Z
-        delta_phi = -np.sin(phi)*delta_X + np.cos(phi)*delta_Y
-
-        return  delta_r, delta_theta, delta_phi
-    
-    def derivatives_neutral(self, x, Pgroup, f):
-        
-        # import pdb; pdb.set_trace()
         # unpack state space
         r, theta, phi, kr, ktheta, kphi, P, s = x
 
         omega = 2*np.pi*f 
 
         # calculate geodetic coordinates 
-        # x_ecef, y_ecef, z_ecef = GeoModel.convert_spherical_to_ecef(r, np.rad2deg(theta), 90 - np.rad2deg(phi))
-
         x_ecef, y_ecef, z_ecef = GeoModel.convert_spherical_to_ecef(r, theta, phi)
         lat, lon, alt = GeoModel.convert_ecef_to_lla(x_ecef, y_ecef, z_ecef) # deg deg m 
 
         # calculate index of refraction and spatial derivatives
-        if alt > 60e3:
+        if alt > 70e3:
         # if False:
             n_refract, n_derivatives = 1, np.zeros(3)
         else:
             n_refract, n_derivatives = self.neutral(lat, lon, alt)
 
-            # dr_dPgroup = kr /omega * const.c  
-            # dtheta_dPgroup = ktheta /omega * const.c  
-            # dphi_dPgroup = kphi /omega * const.c  
-            # deltakr_dPgroup = 0
-            # deltaktheta_dPgroup = 0
-            # deltakphi_dPgroup = 0
-            # dP_dPgroup = -const.c / omega * (kr * dr_dPgroup + ktheta * r * dtheta_dPgroup + kphi * r * np.sin(theta)*dphi_dPgroup) 
-            # ds_dPgroup = np.sqrt( (dr_dPgroup)**2 + r**2 * (dtheta_dPgroup)**2 + (r*np.sin(theta))**2 * (dphi_dPgroup)**2 )
-
         # calculate hamiltonian derivatives
         deltaH_deltar, deltaH_deltatheta, deltaH_deltaphi, deltaH_deltaomega, deltaH_deltakr, deltaH_deltaktheta, deltaH_deltakphi = self.hamiltonian_neutral_atmosphere(x, f, n_refract, n_derivatives)
 
-        # equation 9 
-        dr_dPgroup = - 1 /(self.c) * deltaH_deltakr / deltaH_deltaomega
-
-        # equation 10 
-        dtheta_dPgroup = - 1 /(r*self.c) * deltaH_deltaktheta / deltaH_deltaomega
-
-        # equation 11 
-        dphi_dPgroup = - 1 /(r*self.c*np.sin(theta)) * deltaH_deltakphi / deltaH_deltaomega 
-
-        # equation 12 
-        deltakr_dPgroup =  1/(self.c) * deltaH_deltar / deltaH_deltaomega + ktheta * dtheta_dPgroup + kphi * np.sin(theta) * dphi_dPgroup
-
-        # equation 13 
-        deltaktheta_dPgroup = 1/(r) * ( (1/self.c)* deltaH_deltatheta / deltaH_deltaomega - ktheta * dr_dPgroup + kphi * r* np.cos(theta) * dphi_dPgroup)
-
-        # equation 14 
-        deltakphi_dPgroup = 1/(r*np.sin(theta)) * ( (1/self.c) * deltaH_deltaphi / deltaH_deltaomega - kphi * np.sin(theta) * dr_dPgroup - kphi * r * np.cos(theta) * dtheta_dPgroup)
-
-        # equation 16 
-        dP_dPgroup = -const.c / omega * (kr * dr_dPgroup + ktheta * r * dtheta_dPgroup + kphi * r * np.sin(theta)*dphi_dPgroup) 
-
-        # equation 18
-        ds_dPgroup = np.sqrt( (dr_dPgroup)**2 + r**2 * (dtheta_dPgroup)**2 + (r*np.sin(theta))**2 * (dphi_dPgroup)**2 )
-
-        return [dr_dPgroup, dtheta_dPgroup, dphi_dPgroup, deltakr_dPgroup, deltaktheta_dPgroup, deltakphi_dPgroup, dP_dPgroup, ds_dPgroup]
+        return self.group_path_derivatives(x, omega, 
+                                            deltaH_deltar, deltaH_deltatheta, deltaH_deltaphi, 
+                                            deltaH_deltaomega, 
+                                            deltaH_deltakr, deltaH_deltaktheta, deltaH_deltakphi)
     
-    
+    def derivatives_ionosphere(self, Pgroup:np.float64, x:np.ndarray, f:np.float64, o_mode = True):
+        
+        # unpack state space
+        r, theta, phi, kr, ktheta, kphi, P, s = x
+        omega = 2*np.pi*f 
 
-    def derivatives(self, x, f, o_mode = True):
+        x_ecef, y_ecef, z_ecef = GeoModel.convert_spherical_to_ecef(r, theta, phi)
+        lat, lon, alt = GeoModel.convert_ecef_to_lla(x_ecef, y_ecef, z_ecef) # deg deg m 
+       
+        # get electron density 
+        n_e, n_e_derivatives = self.iono(lat, lon, alt)
+
+        omega0 = np.sqrt(n_e * const.e**2 / (const.epsilon_0 * const.m_e) )
+        X = omega0**2/(omega**2) 
+
+        deltaH_deltar, deltaH_deltatheta, deltaH_deltaphi, \
+                deltaH_deltaomega, \
+                deltaH_deltakr, deltaH_deltaktheta, deltaH_deltakphi = Raytracer.hamiltonian_ionosphere_no_field_no_collisions(x, f, n_e, n_e_derivatives)
+
+        return Raytracer.group_path_derivatives(x, omega, 
+                                            deltaH_deltar, deltaH_deltatheta, deltaH_deltaphi, 
+                                            deltaH_deltaomega, 
+                                            deltaH_deltakr, deltaH_deltaktheta, deltaH_deltakphi)
+
+
+    def derivatives(self, Pgroup:np.float64, x:np.ndarray, f:np.float64, o_mode = True):
         """
         derivative with respect to group path length
         x is state space
@@ -210,84 +240,31 @@ class Raytracer():
         r, theta, phi, kr, ktheta, kphi, P, s = x
 
         # calculate geodetic coordinates 
-        x, y, z = GeoModel.convert_spherical_to_ecef(r, np.rad2deg(theta), 90 - np.rad2deg(phi))
-        lat, lon, alt = GeoModel.convert_ecef_to_lla(x, y, z) # deg deg m 
+        x_ecef, y_ecef, z_ecef= GeoModel.convert_spherical_to_ecef(r, np.rad2deg(theta), 90 - np.rad2deg(phi))
+        lat, lon, alt = GeoModel.convert_ecef_to_lla(x_ecef, y_ecef, z_ecef) # deg deg m 
+        # omega = np.sqrt(const.c**2 * (kr**2 + ktheta**2 + kphi**2))
 
-        if alt > 50e3:
+        # if alt > 60e3:
+        #     # get iono derivatives 
+        #     derivatives = self.derivatives_ionosphere(Pgroup, x, f)
 
-        # get the magnetic field
-        Br, Btheta, Bphi  = self.magneto.get_magnetic_field(lat, lon, alt/1e3)
-        B0 = np.sqrt(Br**2 + Btheta**2 + Bphi**2)
+        # else: 
+        #     # neutral atmosphere case 
+        #     derivatives = self.derivatives_neutral(Pgroup,x, f)
+    
+        derivatives = self.derivatives_ionosphere(Pgroup, x, f)
 
-        # get electron density 
-        n_e = self.iono.get_electron_density(lat, lon, alt/1e3)
+        # if alt > 50e3:
+            # get iono derivatives 
+        # derivatives_iono = self.derivatives_ionosphere(x, Pgroup, f)
+        # derivatives_neutral = self.derivatives_neutral(x, Pgroup, f)
+        # derivatives = tuple(map(sum,zip(derivatives_iono,derivatives_neutral)))
 
-        # calculate the angle between the magnetic field and the ray 
-        angle_between_magfield_wavevector = self.angle_between_spherical_vectors(ktheta, kphi, kr, Btheta, Bphi, Br) # rad
-
-        # calculate the refractive index of ionosphere
-        omega = np.sqrt(const.c*(kr**2 + ktheta**2 + kphi**2))
-
-        # omega = 2*np.pi*f 
-
-        # electron plasma frequency 
-        omega0 = np.sqrt(n_e * const.e**2 / (const.epsilon_0 * const.m_e) )
-        
-        # electron gyrofrequency 
-        omegaH = B0 * const.e / (const.m_e)
-        X = omega0**2/(omega**2) 
-        Y = omegaH/omega
-        Yr = Br/omega
-        Ytheta = Btheta/omega
-        Yphi = Bphi/omega
-
-
-
-        # n2 = 1 - ( X*(1-X)
-        #           / (1 - X - 0.5*Y**2 * (np.sin(angle_between_magfield_wavevector))**2 
-        #                      + mode_sign*np.sqrt(  (0.5*Y**2 * (np.sin(angle_between_magfield_wavevector))**2)**2  
-        #                                     +(1-X)**2 *Y**2 * (np.cos(angle_between_magfield_wavevector))**2)  )   )
-        # x mode 
-
-        # calculate the refractive index of neutral atmosphere 
-
-
-        # determine which regime the ray is in 
-
-        use_iono = True 
-        if use_iono:
-            deltaH_deltar, deltaH_deltatheta, deltaH_deltaphi, deltaH_deltaomega, deltaH_deltakr, deltaH_deltaktheta, deltaH_deltakphi = self.hamiltonian_derivatives_Booker_quartic_with_field_no_collisions(x, f,angle_between_magfield_wavevector, omega0, omegaH)
-        else:
-            partials = self.hamiltonian_neutral_atmosphere(x, f)
-
-        # equation 9 
-        dr_dPgroup = - 1 /(self.c) * deltaH_deltakr / deltaH_deltaomega
-
-        # equation 10 
-        dtheta_dPgroup = - 1 /(r*self.c) * deltaH_deltaktheta / deltaH_deltaomega
-
-        # equation 11 
-        dphi_dPgroup = - 1 /(r*self.c*np.sin(theta)) * deltaH_deltakphi / deltaH_deltaomega 
-
-        # equation 12 
-        deltakr_dPgroup =  1/(self.c) * deltaH_deltar / deltaH_deltaomega + ktheta * dtheta_dPgroup + kphi * np.sin(theta) * dphi_dPgroup
-
-        # equation 13 
-        deltaktheta_dPgroup = 1/(r) * ( (1/self.c)* deltaH_deltatheta / deltaH_deltaomega - ktheta * dr_dPgroup + kphi * r* np.cos(theta) * dphi_dPgroup)
-
-        # equation 14 
-        deltakphi_dPgroup = 1/(r*np.sin(theta)) * ( (1/self.c) * deltaH_deltaphi / deltaH_deltaomega - kphi * np.sin(theta) * dr_dPgroup - kphi * r * np.cos(theta) * dtheta_dPgroup)
-
-        # equation 16 
-        dP_dPgroup = -const.c / omega * (kr * dr_dPgroup + ktheta * r * dtheta_dPgroup + kphi * r * np.sin(theta)*dphi_dPgroup) 
-
-        # equation 18
-        ds_dPgroup = np.sqrt( (dr_dPgroup)**2 + r**2 * (dtheta_dPgroup)**2 + (r*np.sin(theta))**2 * (dphi_dPgroup)**2 )
-
-        return [dr_dPgroup, dtheta_dPgroup, dphi_dPgroup, deltakr_dPgroup, deltaktheta_dPgroup, deltakphi_dPgroup, dP_dPgroup, ds_dPgroup]
+        return derivatives
     
     @staticmethod
-    def hamiltonian_neutral_atmosphere(x, f, n,  n_derivatives):
+    @jit(nopython=True)
+    def hamiltonian_neutral_atmosphere(x : list[float], f : float, n : float,  n_derivatives : np.ndarray):
         """
         x : state vector 
         f : frequency (Hz)
@@ -297,7 +274,7 @@ class Raytracer():
         # unpack statespace 
         r, theta, phi, kr, ktheta, kphi, P, s = x
 
-        # assume 
+        # assume neutral atmosphere is not dispersive 
         nprime = n 
         deltan_deltaVr = 0
         deltan_deltaVtheta = 0
@@ -330,42 +307,243 @@ class Raytracer():
         deltaH_deltakphi = const.c**2/(omega**2) * kphi - const.c/omega * n * deltan_deltaVphi
 
         return  deltaH_deltar, deltaH_deltatheta, deltaH_deltaphi, deltaH_deltaomega, deltaH_deltakr, deltaH_deltaktheta, deltaH_deltakphi
+    
+    @staticmethod
+    @jit(nopython=True)
+    def hamiltonian_ionosphere_no_field_no_collisions(x : list[float], f : float, n_e : float, n_e_derivatives : np.ndarray):
+        """
+        x : state vector
+        f : frequency (Hz)
+        n_e : electron density (m^-3)
+        n_e_derivatives : electron density spatial derivatives [d_ne/dr, d_ne/dtheta, d_ne/dphi](m^-3) 
+        """
+        # unpack state space
+        r, theta, phi, kr, ktheta, kphi, P, s = x
+        omega = 2*np.pi*f
+        
+        deltaX_deltar =    const.e**2/(const.epsilon_0 * const.m_e * omega**2) * n_e_derivatives[0]
+        deltaX_deltatheta =  const.e**2/(const.epsilon_0 * const.m_e * omega**2) * n_e_derivatives[1]
+        deltaX_deltaphi =  const.e**2/(const.epsilon_0 * const.m_e * omega**2) * n_e_derivatives[2]
 
-    def hamiltonian_derivatives_Booker_quartic_with_field_no_collisions(self, omega0,omegaH, Yr, Ytheta, Yphi, f, x):
+        nnprime = 1 
+        
+        ndeltan_deltaX = -0.5 # eq 82 
+        ndeltan_deltar = ndeltan_deltaX * deltaX_deltar
+        ndeltan_deltatheta = ndeltan_deltaX * deltaX_deltatheta
+        ndeltan_deltaphi =  ndeltan_deltaX * deltaX_deltaphi
+        ndeltan_deltaVr = 0
+        ndeltan_deltaVtheta = 0
+        ndeltan_deltaVphi = 0
+
+        # eq 24 
+        deltaH_deltar = -ndeltan_deltar 
+        # eq 25 
+        deltaH_deltatheta = -ndeltan_deltatheta
+        # eq 26
+        deltaH_deltaphi = -ndeltan_deltaphi
+        # eq 27
+        deltaH_deltaomega = -nnprime/omega
+        # eq 28
+        deltaH_deltakr = const.c**2/(omega**2) * kr - const.c/omega * ndeltan_deltaVr
+        # eq 29
+        deltaH_deltaktheta = const.c**2/(omega**2) * ktheta - const.c/omega * ndeltan_deltaVtheta
+        # eq 30
+        deltaH_deltakphi = const.c**2/(omega**2) * kphi - const.c/omega * ndeltan_deltaVphi
+
+        return  deltaH_deltar, deltaH_deltatheta, deltaH_deltaphi, deltaH_deltaomega, deltaH_deltakr, deltaH_deltaktheta, deltaH_deltakphi
+
+    @staticmethod
+    @jit(nopython=True)
+    def group_path_derivatives(x : list[float], omega : float, 
+                                deltaH_deltar : float, deltaH_deltatheta : float, deltaH_deltaphi : float, 
+                                deltaH_deltaomega : float, 
+                                deltaH_deltakr : float, deltaH_deltaktheta : float, deltaH_deltakphi : float) -> list[float]:
+        
+        r, theta, phi, kr, ktheta, kphi, P, s = x
+
+        # equation 9 
+        dr_dPgroup = - 1 /(const.c) * deltaH_deltakr / deltaH_deltaomega
+
+        # equation 10 
+        dtheta_dPgroup = - 1 /(r*const.c) * deltaH_deltaktheta / deltaH_deltaomega
+
+        # equation 11 
+        dphi_dPgroup = - 1 /(r*const.c*np.sin(theta)) * deltaH_deltakphi / deltaH_deltaomega 
+
+        # equation 12 
+        deltakr_dPgroup =  1/(const.c) * deltaH_deltar / deltaH_deltaomega + ktheta * dtheta_dPgroup + kphi * np.sin(theta) * dphi_dPgroup
+
+        # equation 13 
+        deltaktheta_dPgroup = 1/(r) * ( (1/const.c)* deltaH_deltatheta / deltaH_deltaomega - ktheta * dr_dPgroup + kphi * r* np.cos(theta) * dphi_dPgroup)
+
+        # equation 14 
+        deltakphi_dPgroup = 1/(r*np.sin(theta)) * ( (1/const.c) * deltaH_deltaphi / deltaH_deltaomega - kphi * np.sin(theta) * dr_dPgroup - kphi * r * np.cos(theta) * dtheta_dPgroup)
+
+        # equation 16 
+        dP_dPgroup = -const.c / omega * (kr * dr_dPgroup + ktheta * r * dtheta_dPgroup + kphi * r * np.sin(theta)*dphi_dPgroup) 
+
+        # equation 18
+        # ds_dPgroup = np.sqrt( (dr_dPgroup)**2 + r**2 * (dtheta_dPgroup)**2 + (r*np.sin(theta))**2 * (dphi_dPgroup)**2 )
+        ds_dPgroup = -np.sqrt( (deltaH_deltakr)**2 + (deltaH_deltaktheta)**2 + (deltaH_deltakphi)**2 ) / (const.c * deltaH_deltaomega)
+
+        return [dr_dPgroup, dtheta_dPgroup, dphi_dPgroup, deltakr_dPgroup, deltaktheta_dPgroup, deltakphi_dPgroup, dP_dPgroup, ds_dPgroup]
+    
+    def hamiltonian_ionosphere_with_field_no_collisions(x, f, omega0, omegaH, n_e_derivatives, Bfield, Bfield_mag_derivatives, mode_sign = 1 ):
+        """
+        x : state vector
+        f : frequency (Hz)
+        omega0 : plasma frequency (Hz)
+        omegaH : gyro frequency (Hz)
+        """
+
+        # ignore collisions 
+        deltaZ_deltar = 0 
+        deltaZ_deltatheta = 0
+        deltaZ_deltaphi = 0
+        
+        # unpack state space
+        r, theta, phi, kr, ktheta, kphi, P, s = x
+        
+        # gyrofrequency components
+        omega = 2*np.pi*f
+        omegaH_r = np.abs(const.e) * Bfield[0] / const.m_e
+        omegaH_theta = np.abs(const.e) * Bfield[1] / const.m_e
+        omegaH_phi = np.abs(const.e) * Bfield[2] / const.m_e
+
+        # gyrofrequency ratio 
+        Y = omegaH/omega # 36
+        Yr = omegaH_r/omega 
+        Ytheta = omegaH_theta/omega 
+        Yphi = omegaH_phi/omega 
+
+
+        # plasma frequency derivatives
+        deltaX_deltar =    const.e**2/(const.epsilon_0 * const.m_e * omega**2) * n_e_derivatives[0]
+        deltaX_deltatheta =  const.e**2/(const.epsilon_0 * const.m_e * omega**2) * n_e_derivatives[1]
+        deltaX_deltaphi =  const.e**2/(const.epsilon_0 * const.m_e * omega**2) * n_e_derivatives[2]
+
+        # gyrofrequency derivatives
+        deltaY_deltar = Bfield_mag_derivatives[0] *  np.abs(const.e)/(omega * const.m_e)
+        deltaY_deltatheta = Bfield_mag_derivatives[1] *  np.abs(const.e)/(omega * const.m_e)
+        deltaY_deltaphi = Bfield_mag_derivatives[2] *  np.abs(const.e)/(omega * const.m_e)
+
+        psi = GeoModel.angle_between_spherical_vectors(kr, ktheta, kphi, Bfield[0], Bfield[1], Bfield[2])       
+        # deltan_deltaf = 1
+        
+        nsquared = 1 - 2*X *( 1 - X) /(2*(1-X) - Y_T**2 + mode_sign*np.sqrt(Y_T**4 + 4*Y_L**2 *(1-X)**2) ) # eq 34
+        wave_array = np.asarray([kr, ktheta, kphi])
+        
+        # 
+        V_R= 1
+        V = 1
+
+        X = omega0**2/(omega**2) # eq 35
+        Y = omegaH/omega # 36
+        Y_T = Y * np.sin(psi) # eq 38
+        Y_L = Y*np.cos(psi) # eq 39
+        U = 1 # eq 46 
+        RAD = mode_sign* np.sqrt(Y_T**4 + 4*Y_L**2 *(U-X)**2) # eq 47
+        D = 2*U*(U-X) - Y_T**2 + RAD # eq 48
+
+        # eq 50
+        ndeltan_deltaYLYTdeltaPsi = 2*X*(U-X)*(-1 + (Y_T**2 - 2*(U-X)**2)/RAD)/D**2
+
+        ndeltan_deltaX = -( 2*U*(U-X) -Y_T**2 *(U-2*X) + (Y_T**4 * (U-2*X) + 4*Y_L**2 *(U-X)**3)/RAD   ) /D**2 #eq 54
+        ndeltan_deltaY = (2*X*(U-X)/(D**2 + Y)) * ( -Y_T**2 + (Y_T**4 + 2*Y_L**2 *(U-X)**2)/RAD    ) #eq 55
+        ndeltan_deltaZ = 1j *X/D**2 *(-2*(U-X)**2 - Y_T**2 + Y_T**4/RAD ) # eq 56
+        
+        # eq 57
+        ndeltan_deltar = ndeltan_deltaX * deltaX_deltar \
+                            + ndeltan_deltaY * deltaY_deltar \
+                            + ndeltan_deltaZ * deltaZ_deltar \
+                            + ndeltan_deltaYLYTdeltaPsi * Y_T * Y_L * deltapsi_deltar 
+        
+        # eq 58
+        ndeltan_deltatheta = ndeltan_deltaX*deltaX_deltatheta \
+                            + ndeltan_deltaY*deltaY_deltatheta \
+                            + ndeltan_deltaZ*deltaZ_deltatheta \
+                            + ndeltan_deltaYLYTdeltaPsi * Y_T * Y_L * deltapsi_deltatheta 
+        # eq 59
+        ndeltan_deltaphi = ndeltan_deltaX*deltaX_deltaphi \
+                            + ndeltan_deltaY*deltaY_deltaphi \
+                            + ndeltan_deltaZ*deltaZ_deltaphi \
+                            + ndeltan_deltaYLYTdeltaPsi * Y_T * Y_L * deltapsi_deltaphi 
+        # eq 60 
+        ndeltan_deltaVr = ndeltan_deltaYLYTdeltaPsi *(V_R * Y_L**2/V**2 - (Y_L/V)*Yr)
+
+        # eq 61
+        ndeltan_deltaVtheta = ndeltan_deltaYLYTdeltaPsi *(V_theta * Y_L**2/V**2 - (Y_L/V)*Ytheta)
+
+        # eq 62
+        ndeltan_deltaVphi = ndeltan_deltaYLYTdeltaPsi *(V_phi * Y_L**2/V**2 - (Y_L/V)*Yphi)
+
+        # eq 24 
+        deltaH_deltar = -ndeltan_deltar 
+        # eq 25 
+        deltaH_deltatheta = -ndeltan_deltatheta
+        # eq 26
+        deltaH_deltaphi = -ndeltan_deltaphi
+        # eq 27
+        deltaH_deltaomega = -nnprime/omega
+        # eq 28
+        deltaH_deltakr = const.c**2/(omega**2) * kr - const.c/omega * n * ndeltan_deltaVr
+        # eq 29
+        deltaH_deltaktheta = const.c**2/(omega**2) * ktheta - const.c/omega * n * ndeltan_deltaVtheta
+        # eq 30
+        deltaH_deltakphi = const.c**2/(omega**2) * kphi - const.c/omega * n * ndeltan_deltaVphi
+
+        return deltaH_deltar, deltaH_deltatheta, deltaH_deltaphi, deltaH_deltaomega, deltaH_deltakr, deltaH_deltaktheta, deltaH_deltakphi
+
+    @staticmethod
+    def hamiltonian_derivatives_Booker_quartic_with_field_no_collisions(x, f, n_e, n_e_derivatives, Bfield, Bfield_mag_derivatives, Bfield_jacobian):
+        """
+        
+        """
+
+        #unpack state space 
         r, theta, phi, kr, ktheta, kphi, P, s = x
         k = np.sqrt(kr**2 + ktheta**2 + kphi**2)
         U = 1 
         omega = 2*np.pi*f 
 
-        X = omega0**2/(omega**2) # eq 35
+        # calculate gyro frequency and vector components
+        B0 = np.linalg.norm(Bfield) # mag field strength 
+        omegaH = np.abs(const.e) * B0 / const.m_e
+        omegaH_r = np.abs(const.e) * Bfield[0] / const.m_e
+        omegaH_theta = np.abs(const.e) * Bfield[1] / const.m_e
+        omegaH_phi = np.abs(const.e) * Bfield[2] / const.m_e
+
         Y = omegaH/omega # 36
+        Yr = omegaH_r/omega 
+        Ytheta = omegaH_theta/omega 
+        Yphi = omegaH_phi/omega 
 
+        # magnetic field spatial derivatives
+        delta_Y_jacobian = Bfield_jacobian * np.abs(const.e)/(omega * const.m_e) #
 
-        # 
-        deltaX_deltar = 1
-        deltaX_deltatheta = 1
-        deltaX_deltaphi = 1
-
-
-        # magnetic field spatial derivatives 
-        dBr_dr, dBr_dtheta, dBr_dphi, dBtheta_dr, dBtheta_dtheta, dBtheta_dphi, dBphi_dr, dBphi_dtheta, dBphi_dphi = self.mag_field_derivative(x)
-
-        # electron plasma frequency spatial derivatives
-        deltaYr_deltar = 1
-        deltaYtheta_deltar = 1
-        deltaYphi_deltar = 1
+        # gyrofrequency derivatives
+        deltaYr_deltar = delta_Y_jacobian[0,0]
+        deltaYtheta_deltar = delta_Y_jacobian[1,0]
+        deltaYphi_deltar = delta_Y_jacobian[2,0]
+        deltaYr_deltatheta = delta_Y_jacobian[0,1]
+        deltaYtheta_deltatheta = delta_Y_jacobian[1,1]
+        deltaYphi_deltatheta = delta_Y_jacobian[2,1]
+        deltaYr_deltaphi = delta_Y_jacobian[0,2]
+        deltaYtheta_deltaphi = delta_Y_jacobian[1,2]
+        deltaYphi_deltaphi = delta_Y_jacobian[2,2]
         
-        deltaYr_deltatheta = 1
-        deltaYtheta_deltatheta = 1
-        deltaYphi_deltatheta = 1
+        deltaY_deltar = Bfield_mag_derivatives[0] *  np.abs(const.e)/(omega * const.m_e)
+        deltaY_deltatheta = Bfield_mag_derivatives[1] *  np.abs(const.e)/(omega * const.m_e)
+        deltaY_deltaphi = Bfield_mag_derivatives[2] *  np.abs(const.e)/(omega * const.m_e)
 
-        deltaYr_deltaphi = 1
-        deltaYtheta_deltaphi = 1
-        deltaYphi_deltaphi = 1
-        
-        deltaY_deltar = 1
-        deltaY_deltatheta = 1
-        deltaY_deltaphi = 1
+
+        # plasma frequency derivatives
+        omega0 = np.sqrt(n_e * const.e**2 / (const.epsilon_0 * const.m_e) )
+        X = omega0**2/(omega**2) # eq 35
+
+        deltaX_deltar =    const.e**2/(const.epsilon_0 * const.m_e * omega**2) * n_e_derivatives[0]
+        deltaX_deltatheta =  const.e**2/(const.epsilon_0 * const.m_e * omega**2) * n_e_derivatives[1]
+        deltaX_deltaphi =  const.e**2/(const.epsilon_0 * const.m_e * omega**2) * n_e_derivatives[2]
 
         # eq 93 
         k_dot_Y = kr*Yr + ktheta*Ytheta + kphi*Yphi
@@ -509,34 +687,3 @@ class Raytracer():
 
         return  deltaH_deltar, deltaH_deltatheta, deltaH_deltaphi, deltaH_deltaomega, deltaH_deltakr, deltaH_deltaktheta, deltaH_deltakphi
     
-    # def ne_derivative(self, x):
-
-    #     return dNe_dr, dNe_dtheta, dNe_dphi
-    
-    # def mag_field_derivative(self,r, theta, phi):
-        
-    #     delta_r = 0.01 
-    #     delta_theta = 0.01 
-    #     delta_phi = 0.01 
-
-    #     # r derivatives
-   
-   
-    #     return dBr_dr, dBr_dtheta, dBr_dphi, dBtheta_dr, dBtheta_dtheta, dBtheta_dphi, dBphi_dr, dBphi_dtheta, dBphi_dphi
-
-
-    @staticmethod
-    def angle_between_spherical_vectors(theta1, phi1, r1, theta2, phi2, r2):
-        """
-        Calculate the angle between two spherical vectors.
-        """
-        x1 = r1*np.sin(phi1)*np.cos(theta1)
-        y1 = r1*np.sin(theta1)*np.sin(phi1)
-        z1 = r1*np.cos(phi1)
-
-        x2 = r1*np.sin(phi2)*np.cos(theta2)
-        y2 = r1*np.sin(theta2)*np.sin(phi2)
-        z2 = r1*np.cos(phi2)
-
-        return np.arccos( (x1*x2 + y1*y2 + z1*z2)  / (r1 * r2)) 
-
