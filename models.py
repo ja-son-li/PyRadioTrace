@@ -56,20 +56,23 @@ class GeoModel():
         return x, y, z
     
     @staticmethod
-    def aer_to_lla_ranges(lat_obs, lon_obs, alt_obs, az, el, ranges):
-        
-        # lats = np.full_like(ranges,np.nan)
-        # lons = np.full_like(ranges,np.nan)
-        # alts = np.full_like(ranges,np.nan)
+    def aer_to_lla_ranges(lat_obs : float, 
+                          lon_obs : float, 
+                          alt_obs : float, 
+                          az : float, 
+                          el : float, 
+                          ranges : np.ndarray):
+        """
+        lat_obs: Observer latitude (degrees).
+        lon_obs: Observer longitude (degrees).
+        alt_obs: Observer altitude (meters).
+        az: Azimuth (degrees).
+        el: Elevation (degrees).
+        ranges: Range (meters).
+        """        
+
         X_plus, Y_plus, Z_plus = GeoModel.aer_to_ecef(lat_obs, lon_obs, alt_obs, az, el, ranges)
         straight_lat,  straight_lon, straight_alt = GeoModel.convert_ecef_to_lla(X_plus, Y_plus, Z_plus)
-
-        # for ind, slant_range in enumerate(ranges):
-
-        #     straight_lat,  straight_lon, straight_alt = GeoModel.convert_ecef_to_lla(X_plus, Y_plus, Z_plus)
-        #     lats[ind] = straight_lat 
-        #     lons[ind] = straight_lon 
-        #     alts[ind] = straight_alt
 
         return straight_lat,  straight_lon, straight_alt 
     
@@ -99,11 +102,6 @@ class GeoModel():
     
     @staticmethod
     def convert_ecef_to_lla(x,y,z):
-
-        # transformer = pyproj.Transformer.from_crs(
-        #     {"proj":'geocent', "ellps":'WGS84', "datum":'WGS84'},
-        #     {"proj":'latlong', "ellps":'WGS84', "datum":'WGS84'},
-        #     )
 
         lon1, lat1, alt1 = transformer_ecef_lla.transform(x,y,z,radians=False)
         return lat1, lon1, alt1 
@@ -259,7 +257,9 @@ class EpsteinLayersModel(GeoModel):
         else:
             B = Bbottom
 
-        aexp = EpsteinLayersModel.fexp((alt - hm) / B)
+        # aexp = EpsteinLayersModel.fexp((alt - hm) / B)
+        aexp = np.exp((alt - hm) / B)
+
         res = Nm * aexp / (1 + aexp)**2
         return res
     
@@ -378,7 +378,8 @@ class IRIModel(GeoModel):
         else:
             B = Bbottom
 
-        aexp = IRIModel.fexp((alt - hm) / B)
+        # aexp = IRIModel.fexp((alt - hm) / B)
+        aexp = np.exp((alt - hm) / B)
         res = Nm * aexp / (1 + aexp)**2
         return res
     
@@ -442,7 +443,7 @@ class IRIModel(GeoModel):
         if alt < 2000:
             n_e = self.epstein(nm_F2, hm_F2, Btop, Bbottom, alt)
 
-            delta_alt = 0.1 # km 
+            delta_alt = 0.01 # km 
             n_e_plus = self.epstein(nm_F2, hm_F2, Btop, Bbottom, alt+delta_alt)
 
             n_derivatives[0] = (n_e_plus - n_e)/(delta_alt * 1e3) # derivative with respect to altitude
