@@ -9,6 +9,7 @@ Atmospheric raytracing
 2. Install the package (ideally in a virtual environment)
 
    ``cd PyRadioTrace``
+   
    ``pip intall -e .`` 
 
 ### 
