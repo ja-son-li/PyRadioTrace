@@ -1,5 +1,5 @@
 import numpy as np
-from models import GeoModel
+from PyRadioTrace.models import GeoModel
 import scipy.constants as const
 from scipy.integrate import odeint, solve_ivp 
 from numba import jit

@@ -1,0 +1,9 @@
+numpy
+scipy
+matplotlib
+numba
+xarray
+pyproj
+ppigrf
+PyIRI
+pymap3d

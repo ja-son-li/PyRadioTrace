@@ -1,0 +1,20 @@
+Metadata-Version: 2.4
+Name: PyRadioTrace
+Version: 0.0.0
+Author-email: Jason Li <Jason.Li@colorado.edu>
+License-Expression: MIT
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: numpy
+Requires-Dist: scipy
+Requires-Dist: matplotlib
+Requires-Dist: numba
+Requires-Dist: xarray
+Requires-Dist: pyproj
+Requires-Dist: ppigrf
+Requires-Dist: PyIRI
+Requires-Dist: pymap3d
+Dynamic: license-file
+
+# PyTrace
+Raytracing with neutral atmosphere and ionospheric refraction
