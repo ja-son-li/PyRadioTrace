@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+
+[project]
+name = "PyRadioTrace"
+version = "1.0.0"
+readme = "README.md"
+authors = [
+    {name = "Jason Li", email = "Jason.Li@colorado.edu"}
+]
+
+dependencies = [
+    "numpy",
+    "scipy",
+    "matplotlib",
+    "numba",
+    "xarray",
+    "pyproj",
+    "ppigrf",
+    "PyIRI",
+    "pymap3d"
+]
+license = "MIT"
+
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["PyRadioTrace"]
