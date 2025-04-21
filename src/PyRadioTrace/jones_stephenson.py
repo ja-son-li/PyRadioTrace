@@ -19,7 +19,8 @@ class Raytracer():
                         6. kphi : spherical coordinate wave normal  (m/m)
                         7. P : total phase (m), 
                         8. s: geometric path length (m)]
-        
+        TODO: ADD TEC 
+
         kr ktheta kphi are normalized such that kr**2 + ktheta**2 + kphi**2 = omega**2/c**2 where omega = 2*pi*f
         """
         self.iono = iono
@@ -35,8 +36,10 @@ class Raytracer():
                             f : np.float64, 
                             resolution_m:np.float64 = 0.01,
                             resolution_angle_deg = 0.1,
+                            xatol = 1e-8,
                             rtol = 1e-5, 
-                            atol = 1e-6) -> scipy.optimize.OptimizeResult:
+                            atol = 1e-6,
+                            elevation_bounds = None) -> scipy.optimize.OptimizeResult:
         """
         transmit_lat : latitude of transmitter (deg)
         transmit_lon : longitude of transmitter (deg)
@@ -57,6 +60,9 @@ class Raytracer():
         # initial guess is straight line of sight pointing 
         initial_guess = el
 
+        if elevation_bounds is None:
+            elevation_bounds = [initial_guess-3, initial_guess+3]
+
         # minimization function
         def optimization_function(el_guess) -> float:
             return self.ray_distance_to_target(transmit_lat, transmit_lon, transmit_alt, 
@@ -65,9 +71,9 @@ class Raytracer():
                                                 group_path_distances=group_path_distances, 
                                                 rtol=rtol, atol=atol)
         
-        result = scipy.optimize.minimize_scalar(optimization_function, bounds = [initial_guess-3, initial_guess+3], 
+        result = scipy.optimize.minimize_scalar(optimization_function, bounds = elevation_bounds, 
                                                                         method='bounded', 
-                                                                        options = {'xatol' : 1e-6})
+                                                                        options = {'xatol' : xatol})
 
         return result 
     
@@ -295,11 +301,32 @@ class Raytracer():
         # unpack state space
         r, theta, phi, kr, ktheta, kphi, P, s = x
 
+
+        lat, lon, alt = GeoModel.convert_spherical_to_lla(r, theta, phi) # deg deg m
+
+        # TODO ADD REFLECTION AT EARTH SURFACE
+
+        # if alt <=0:
+        #     # TODO add reflection at earth surface 
+            
+        #     # convert to local elevaton and azimuth 
+        #     local_az, local_el = get_az_el_from_spherical_pointing(lat, lon alt, kr, ktheta, kphi) 
+
+        #     # convert back to spherical coordinates
+        #     local_el = 90 - local_el
+        #     kr, ktheta, kphi = GeoModel.azel_to_spherical_vector(transmit_lat, transmit_lon, transmit_alt, az, el)
+        #     norm = np.sqrt(kr**2 + ktheta**2 + kphi**2)
+        #     kr = kr/norm * omega/const.c
+        #     ktheta = ktheta/norm *omega/const.c
+        #     kphi = kphi/norm *omega/const.c
+
+        #     pass 
+
+
         # # calculate geodetic coordinates 
         # x_ecef, y_ecef, z_ecef= GeoModel.convert_spherical_to_ecef(r, np.rad2deg(theta), 90 - np.rad2deg(phi))
         # lat, lon, alt = GeoModel.convert_ecef_to_lla(x_ecef, y_ecef, z_ecef) # deg deg m 
         
-        lat, lon, alt = GeoModel.convert_spherical_to_lla(r, theta, phi) # deg deg m
 
 
         # omega = np.sqrt(const.c**2 * (kr**2 + ktheta**2 + kphi**2))
@@ -311,7 +338,7 @@ class Raytracer():
         else: 
             # neutral atmosphere case 
             derivatives = self.derivatives_neutral(Pgroup,x, f)
-    
+
         # derivatives = self.derivatives_ionosphere(Pgroup, x, f)
 
         # if alt > 50e3:
@@ -448,13 +475,13 @@ class Raytracer():
 
 
         # equation 16 
-        dP_dPgroup = -const.c / omega * (kr * dr_dPgroup \
+        dP_dPgroup = const.c / omega * (kr * dr_dPgroup \
                                         + ktheta * r * dtheta_dPgroup \
                                         + kphi * r * np.sin(theta)*dphi_dPgroup) 
 
         # equation 18
         # ds_dPgroup = np.sqrt( (dr_dPgroup)**2 + r**2 * (dtheta_dPgroup)**2 + (r*np.sin(theta))**2 * (dphi_dPgroup)**2 )
-        ds_dPgroup = -np.sqrt( (deltaH_deltakr)**2 + (deltaH_deltaktheta)**2 + (deltaH_deltakphi)**2 ) / (const.c * deltaH_deltaomega)
+        ds_dPgroup = np.sqrt( (dr_dPgroup)**2 + r**2*(dtheta_dPgroup)**2 + (r*np.sin(theta))**2 *(dphi_dPgroup)**2 ) 
 
         return [dr_dPgroup, dtheta_dPgroup, dphi_dPgroup, deltakr_dPgroup, deltaktheta_dPgroup, deltakphi_dPgroup, dP_dPgroup, ds_dPgroup]
     

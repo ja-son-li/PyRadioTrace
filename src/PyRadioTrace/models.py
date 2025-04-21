@@ -16,8 +16,6 @@ transformer_ecef_lla = pyproj.Transformer.from_crs(
             )
 
 class GeoModel():
-    def __init__(self):
-        pass
 
     @staticmethod
     def convert_lla_to_ecef(lat, lon, alt):
@@ -138,6 +136,25 @@ class GeoModel():
         return np.sqrt( r1**2 + r2**2 
                        - 2*r1*r2*(np.sin(theta1)*np.sin(theta2)*np.cos(phi1-phi2)) 
                        + np.cos(theta1)*np.cos(theta2))
+    @staticmethod
+    def spherical_vector_azel(r, theta, phi, kr, ktheta, kphi):
+        
+        # convert position to geodetic and ecef 
+        lat, lon, alt = GeoModel.convert_spherical_to_lla(r, theta, phi)
+        x, y, z = GeoModel.convert_spherical_to_ecef(r, theta, phi)
+
+        # convert to pointing vectors to ecef 
+        x_hat = np.sin(theta)*np.cos(phi)*kr + np.cos(theta)*np.cos(phi)*ktheta - np.sin(phi)*kphi
+        y_hat = np.sin(theta)*np.sin(phi)*kr + np.cos(theta)*np.sin(phi)*ktheta + np.cos(phi)*kphi 
+        z_hat = np.cos(theta)*kr - np.sin(theta)*ktheta 
+
+        # apply pointing vector to ecef position 
+        lat2, lon2, alt2 = GeoModel.convert_ecef_to_lla(x+x_hat, y+y_hat, z+z_hat)
+
+        # get az/el
+        az, el, range = GeoModel.geodetic2aer(lat, lon, alt, lat2, lon2, alt2)
+
+        return  az, el
     
     @staticmethod
     def azel_to_spherical_vector(lat, lon, alt, az, el):
@@ -227,6 +244,7 @@ class EpsteinLayersModel(GeoModel):
             return n_e
     
     @staticmethod
+    @jit(nopython=True)
     def epstein(Nm, hm, Btop, Bbottom, alt):
         """Calculate Epstein function for given parameters.
 
@@ -264,6 +282,7 @@ class EpsteinLayersModel(GeoModel):
         return res
     
     @staticmethod
+    @jit(nopython=True)
     def fexp(x):
         """Calculate exponent without overflow.
 
@@ -302,6 +321,7 @@ class EpsteinLayersModel(GeoModel):
 
         return y
 
+from scipy.interpolate import griddata, RegularGridInterpolator
 
 class IRIModel(GeoModel):
     def __init__(self, dt_UTC):
@@ -319,23 +339,29 @@ class IRIModel(GeoModel):
         self.aUT = np.asarray([dt_UTC.hour + dt_UTC.minute/60.])
 
 
-        # dlat=1       #resolution of geographic latitude {degrees} (integer or float)
-        # dlon=1       #resolution of geographic longitude {degrees} (integer or float)
-        # dalt=10      #resolution of altitude {km} (integer or float)
-        # alt_min=0    #minimum altitude {km} (integer or float)
-        # alt_max=1000  #maximum altitude {km} (integer or float)
-        # alon, alat, alon_2d, alat_2d = PyIRI.main_library.set_geo_grid(dlon, dlat)
-        # lats = np.arange(-90, 90+dlat, dlat)
-        # lons = np.arange(-180, 180+dlon, dlon)
-        # aalt=np.arange(alt_min, alt_max, dalt)
+        dlat=1       #resolution of geographic latitude {degrees} (integer or float)
+        dlon=1       #resolution of geographic longitude {degrees} (integer or float)
+        dalt=10      #resolution of altitude {km} (integer or float)
+        alt_min=0    #minimum altitude {km} (integer or float)
+        alt_max=1200  #maximum altitude {km} (integer or float)
+        alon, alat, alon_2d, alat_2d = PyIRI.main_library.set_geo_grid(dlon, dlat)
+        lats = np.arange(-90, 90+dlat, dlat)
+        lons = np.arange(-180, 180+dlon, dlon)
+        aalt=np.arange(alt_min, alt_max, dalt)
 
-        # # call PyIRI 
-        # F2, F1, E, Es, sun, mag= PyIRI.main_library.IRI_monthly_mean_par(self.year, self.month, self.aUT, alon, alat, coeff_dir)  
-        # min_max_EDP = PyIRI.main_library.reconstruct_density_from_parameters(F2, F1, E, aalt)
+        # call PyIRI 
+        F2, F1, E, Es, sun, mag= PyIRI.main_library.IRI_monthly_mean_par(self.year, self.month, self.aUT, alon, alat, coeff_dir)  
+        min_max_EDP = PyIRI.main_library.reconstruct_density_from_parameters(F2, F1, E, aalt)
         
-        # # take the max or min of the electron density
-        # edp = np.squeeze(min_max_EDP[0,:,:,:]) # aalt x alon/alat
+        # take the max or min of the electron density
+        edp = np.squeeze(min_max_EDP[0,:,:,:]) # aalt x alon/alat
+        edp = edp.reshape(len(aalt), 361, 181)
         
+        # create interpolation object 
+
+        self.interp = RegularGridInterpolator((aalt, alon_2d[:,0], alat_2d[0,:]), edp, bounds_error=False, fill_value= np.nan)
+
+
         # # reshape to 3D grid 
         # edp = edp.reshape(len(aalt), len(lons), len(lats))
 
@@ -347,140 +373,54 @@ class IRIModel(GeoModel):
         #                                 lat = ('lat',lats),
         #                                 alt = ('alt', aalt))
         #                     )
-    @staticmethod
-    def epstein(Nm, hm, Btop, Bbottom, alt):
-        """Calculate Epstein function for given parameters.
-
-        Parameters
-        ----------
-        Nm : array-like
-            Peak density in m-3.
-        hm : array-like
-            Height of peak density in km.
-        B : array-like
-            Thickness of the layer in km.
-        alt : array-like
-            Altitude array in km.
-
-        Returns
-        -------
-        res : array-like
-            Constructed Epstein profile in m-3.
-
-        Notes
-        -----
-        This function returns epstein function for given parameters.
-        In a typical Epstein function: X = Nm, Y = hm, Z = B, and W = alt.
-
-        """
-        if alt > hm:
-            B = Btop
-        else:
-            B = Bbottom
-
-        # aexp = IRIModel.fexp((alt - hm) / B)
-        aexp = np.exp((alt - hm) / B)
-        res = Nm * aexp / (1 + aexp)**2
-        return res
-    
-    @staticmethod
-    def fexp(x):
-        """Calculate exponent without overflow.
-
-        Parameters
-        ----------
-        x : array-like
-            Any input.
-
-        Returns
-        -------
-        y : array-like
-            Exponent of x.
-
-        Notes
-        -----
-        This function function caclulates exp(x) with restrictions to not cause
-        overflow.
-
-        """
-        if (isinstance(x, float)) or (isinstance(x, int)):
-            if x > 80:
-                y = 5.5406E34
-            if x < -80:
-                y = 1.8049E-35
-            else:
-                y = np.exp(x)
-
-        if isinstance(x, np.ndarray):
-            y = np.zeros((x.shape))
-            a = np.where(x > 80.)
-            b = np.where(x < -80.)
-            c = np.where((x >= -80.) & (x <= 80.))
-            y[a] = 5.5406E34
-            y[b] = 1.8049E-35
-            y[c] = np.exp(x[c])
-
-        return y
-    
     def __call__(self, lat, lon, alt, with_derivatives = True):
         """
         Interpolates the electron density at a given latitude (deg), longitude (deg), and altitude (m).
         count per meter cubed
         """
-        # convert alt to km
-        alt = alt/1e3
+        # wrap angles long (-180 to 180) 
+        lon =  (lon + 180) % 360 - 180
+        lat = (lat + 90) % 180 - 90
 
-        # triple chapman layer 
-        hm_F2 = 300 # km
-        nm_F2 = 2.28050755e11 # m^-3
-        nm_F2 = 1.4e12 
-        Btop = 35 # km
-        Bbottom = 23.5 #km 
-
-        n_e = 0
-        n_derivatives = np.zeros(3)
-
-        if alt < 2000:
-            n_e = self.epstein(nm_F2, hm_F2, Btop, Bbottom, alt)
-
-            delta_alt = 0.01 # km 
-            n_e_plus = self.epstein(nm_F2, hm_F2, Btop, Bbottom, alt+delta_alt)
-
-            n_derivatives[0] = (n_e_plus - n_e)/(delta_alt * 1e3) # derivative with respect to altitude
-
-        return n_e, n_derivatives
-       
-        # interpolate_result = self.edp_ds.interp(lat= lat, lon= lon, alt=  alt/1e3, method='linear')
-        # ne = interpolate_result['edp'].values
+        if alt/1e3 <= 1000:
+            ne = self.interp( [alt/1e3, lon, lat]).item()
+        else:
+            ne = 0
+            ne_derivatives = np.zeros(3)
+            return ne, ne_derivatives
         
-        # # spherical derivatives 
-        # if with_derivatives:
-        #     x, y, z = self.convert_lla_to_ecef(lat, lon, alt)
-        #     r, theta, phi = self.convert_ecef_to_spherical(x, y, z)
+        # spherical derivatives 
+        if with_derivatives:
+            x, y, z = self.convert_lla_to_ecef(lat, lon, alt)
+            r, theta, phi = self.convert_ecef_to_spherical(x, y, z)
 
-        #     delta_r = 1e3 # m
-        #     delta_theta = 0.01 # rad 
-        #     delta_phi = 0.01 # rad 
+            delta_r = 0.01 # m
+            delta_theta = 0.01 # rad 
+            delta_phi = 0.01 # rad 
 
-        #     # calculate the partial derivatives of the electron density
-        #     lat_deltar, lon_deltar, alt_deltar = self.convert_spherical_to_lla(r+delta_r, theta, phi)
-        #     ne_deltar = (self.edp_ds.interp(lat= lat_deltar, lon= lon_deltar, alt=  alt_deltar/1e3, method='linear'))['edp'].values
-        #     deltane_deltar = (ne_deltar - ne)/delta_r
+            # calculate the partial derivatives of the electron density
+            lat_deltar, lon_deltar, alt_deltar = self.convert_spherical_to_lla(r+delta_r, theta, phi)
+            ne_deltar = self.interp( [alt_deltar/1e3, lon_deltar, lat_deltar]).item()
+            deltane_deltar = (ne_deltar - ne)/delta_r
 
-        #     lat_deltatheta, lon_deltatheta, alt_deltatheta = self.convert_spherical_to_lla(r, theta+delta_theta, phi)
-        #     ne_deltatheta = (self.edp_ds.interp(lat= lat_deltatheta, lon= lon_deltatheta, alt=  alt_deltatheta/1e3, method='linear'))['edp'].values
-        #     deltane_deltatheta = (ne_deltatheta - ne)/delta_theta
+            lat_deltatheta, lon_deltatheta, alt_deltatheta = self.convert_spherical_to_lla(r, theta+delta_theta, phi)
+            ne_deltatheta = self.interp( [alt_deltatheta/1e3, lon_deltatheta, lat_deltatheta]).item()
+            deltane_deltatheta = (ne_deltatheta - ne)/delta_theta
 
-        #     lat_deltaphi, lon_deltaphi, alt_deltaphi = self.convert_spherical_to_lla(r, theta, phi+delta_phi)
-        #     ne_deltaphi = (self.edp_ds.interp(lat= lat_deltaphi, lon= lon_deltaphi, alt=  alt_deltaphi/1e3, method='linear'))['edp'].values
-        #     deltane_deltaphi = (ne_deltaphi - ne)/delta_phi
+            lat_deltaphi, lon_deltaphi, alt_deltaphi = self.convert_spherical_to_lla(r, theta, phi+delta_phi)
+            ne_deltaphi = self.interp( [alt_deltaphi/1e3, lon_deltaphi, lat_deltaphi]).item()
+            deltane_deltaphi = (ne_deltaphi - ne)/delta_phi
 
-        #     ne_derivatives = np.array([deltane_deltar, deltane_deltatheta, deltane_deltaphi])
+            ne_derivatives = np.array([deltane_deltar, deltane_deltatheta, deltane_deltaphi])
+            # ne_derivatives = np.array([deltane_deltar, 0, 0])
 
-        #     return ne, ne_derivatives
-        # else:
-        #     return ne
+
+            return ne, ne_derivatives
+        else:
+            return ne
+
     
+
 class IGRF(GeoModel):
     def __init__(self, dt_UTC):
         """
