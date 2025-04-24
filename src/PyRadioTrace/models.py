@@ -8,6 +8,8 @@ import ppigrf
 import pymsis
 import pymap3d as pm
 from numba import jit
+from scipy.interpolate import griddata, RegularGridInterpolator
+
 
 transformer_lla_ecef = pyproj.Transformer.from_crs("epsg:4326", "epsg:4978", always_xy=True)
 transformer_ecef_lla = pyproj.Transformer.from_crs(
@@ -16,7 +18,9 @@ transformer_ecef_lla = pyproj.Transformer.from_crs(
             )
 
 class GeoModel():
-
+    """
+    List of helper functions  
+    """
     @staticmethod
     def convert_lla_to_ecef(lat, lon, alt):
         """
@@ -195,6 +199,9 @@ class GeoModel():
 
 
 class EpsteinLayersModel(GeoModel):
+    """
+    Epstein Ionospheric Layer Model
+    """
     def __init__(self, nm_list : list[float] = [1.4e12], 
                         hm_list : list[float]= [300], 
                         Bbottom_list:list[float] = [23.5], 
@@ -321,12 +328,14 @@ class EpsteinLayersModel(GeoModel):
 
         return y
 
-from scipy.interpolate import griddata, RegularGridInterpolator
 
 class IRIModel(GeoModel):
+    """
+    Wrapper for PyIRI
+    """
     def __init__(self, dt_UTC):
         """
-        
+        dt_UTC  : datetime object
         """
         # find coefficients directory
         coeff_dir = os.path.join(os.path.dirname(PyIRI.__file__), 'coefficients')
@@ -342,11 +351,11 @@ class IRIModel(GeoModel):
         dlat=1       #resolution of geographic latitude {degrees} (integer or float)
         dlon=1       #resolution of geographic longitude {degrees} (integer or float)
         dalt=10      #resolution of altitude {km} (integer or float)
-        alt_min=0    #minimum altitude {km} (integer or float)
+        alt_min=50    #minimum altitude {km} (integer or float)
         alt_max=1200  #maximum altitude {km} (integer or float)
         alon, alat, alon_2d, alat_2d = PyIRI.main_library.set_geo_grid(dlon, dlat)
-        lats = np.arange(-90, 90+dlat, dlat)
-        lons = np.arange(-180, 180+dlon, dlon)
+        # lats = np.arange(-90, 90+dlat, dlat)
+        # lons = np.arange(-180, 180+dlon, dlon)
         aalt=np.arange(alt_min, alt_max, dalt)
 
         # call PyIRI 
@@ -358,21 +367,8 @@ class IRIModel(GeoModel):
         edp = edp.reshape(len(aalt), 361, 181)
         
         # create interpolation object 
-
         self.interp = RegularGridInterpolator((aalt, alon_2d[:,0], alat_2d[0,:]), edp, bounds_error=False, fill_value= np.nan)
 
-
-        # # reshape to 3D grid 
-        # edp = edp.reshape(len(aalt), len(lons), len(lats))
-
-        # # put into xarray dataset
-        # self.edp_ds = xr.Dataset( data_vars = dict( 
-        #                         edp = (["alt", "lon" ,"lat"], edp),
-        #                     ),
-        #                     coords= dict(lon = ('lon',lons),
-        #                                 lat = ('lat',lats),
-        #                                 alt = ('alt', aalt))
-        #                     )
     def __call__(self, lat, lon, alt, with_derivatives = True):
         """
         Interpolates the electron density at a given latitude (deg), longitude (deg), and altitude (m).
@@ -412,18 +408,16 @@ class IRIModel(GeoModel):
             deltane_deltaphi = (ne_deltaphi - ne)/delta_phi
 
             ne_derivatives = np.array([deltane_deltar, deltane_deltatheta, deltane_deltaphi])
-            # ne_derivatives = np.array([deltane_deltar, 0, 0])
-
 
             return ne, ne_derivatives
         else:
             return ne
 
     
-
 class IGRF(GeoModel):
     def __init__(self, dt_UTC):
         """
+        Wrapper for PPIGRF
         """
         self.dt_UTC = dt_UTC
     
@@ -480,6 +474,9 @@ class IGRF(GeoModel):
             return B_vec
         
 class ScaleHeight(GeoModel):
+    """
+    Simple Scale Height Model for the atmosphere 
+    """
     def __init__(self, N0: float = 400, H: float = 7e3):
         """
         N0 : float
@@ -489,13 +486,21 @@ class ScaleHeight(GeoModel):
         self.H = H
 
     def __call__(self, lat: float, lon: float, alt: float, with_derivatives: bool = True):
-        N0 = self.N0
-        H = self.H
+
         
         n = 1
         n_derivatives = np.zeros(3)
+        if alt > 100e3:
+            n = 1
+        # elif alt < 0:
+        #     N0 = 10000
+        #     n = 1 + N/1e6 # refractivity
+        #     n_derivatives[0] = N0 * np.exp(-alt/H)/1e6 * (-1/H) # derivative with respect to altitude
 
-        if alt < 100e3 and alt > 0:
+        else:
+        # if alt < 100e3 and alt > 0:
+            N0 = self.N0
+            H = self.H
             N = N0*np.exp(-alt/H)
             n = 1 + N/1e6 # refractivity
             n_derivatives = np.zeros(3)
@@ -507,6 +512,9 @@ class ScaleHeight(GeoModel):
             return n
     
 class MSIS(GeoModel):
+    """
+    Wrapper for PyMSIS
+    """
     def __init__(self, dt_UTC):
         """
         """
@@ -520,19 +528,22 @@ class MSIS(GeoModel):
         aalt=np.arange(alt_min, alt_max, dalt)
         date64 = np.datetime64(dt_UTC)
 
-        # data = pymsis.calculate(date64, lons, lats, aalt, geomagnetic_activity=-1)   #[ndates, nlons, nlats, nalts, 11]
+        data = pymsis.calculate(date64, lons, lats, aalt, geomagnetic_activity=-1)   #[ndates, nlons, nlats, nalts, 11]
 
-        # density = data[...,0] # kg/ m^-3
-        # temperature = data[...,-1] #temperature in K
-        # volume = 1 #m^3 
-        # R = 8.31446261815324 # J/(mol K)
-        # n = 28.96e-3 # kg/mol
-        # # convert density to pressure via ideal gas law
-        # pressure = density/n * R * temperature / volume # Pa
+        density = data[...,0] # kg/ m^-3
+        temperature = data[...,-1] #temperature in K
+        volume = 1 #m^3 
+        R = 8.31446261815324 # J/(mol K)
+        n = 28.96e-3 # kg/mol
+        # convert density to pressure via ideal gas law
+        pressure = density/n * R * temperature / volume # Pa
         
-        # # calculate refractivity 
-        # Nd = 77.64*pressure*1e-2/temperature
-        # n = Nd/1e6 + 1 
+        # calculate refractivity 
+        Nd = 77.64*pressure*1e-2/temperature
+        n = Nd/1e6 + 1 
+
+
+
         # # import pdb
         # # pdb.set_trace()
         # # put into xarray dataset 

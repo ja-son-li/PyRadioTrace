@@ -9,8 +9,6 @@ class Raytracer():
 
     def __init__(self, iono = None, magneto = None, neutral = None, o_mode = True):
         """"
-
-
         state space is [1. r : spherical coordinate radius (m), 
                         2. theta : spherical coordinate longitude (rad), 
                         3. phi : spherical coordinate colatitude (rad),
@@ -137,7 +135,7 @@ class Raytracer():
         # result = scipy.optimize.fmin(optimization_function, initial_guess,  xtol=resolution_angle_deg, ftol=resolution_m, disp=True)
 
         return result
-     
+
     def ray_distance_to_target(self, transmit_lat:np.float64, transmit_lon:np.float64, transmit_alt:np.float64, 
                                     receiver_lat:np.float64, receiver_lon:np.float64, receiver_alt:np.float64,
                                     az:np.float64, el:np.float64, f:np.float64, 
@@ -167,8 +165,83 @@ class Raytracer():
 
         min_distance = np.nanmin(distances)
         return min_distance
+    
+    def ray_propagate_with_bounce(self, transmit_lat: np.float64, 
+                            transmit_lon: np.float64,
+                            transmit_alt: np.float64, 
+                            az: np.float64,
+                            el: np.float64,
+                            f : np.float64,
+                            group_path_distances:np.ndarray = np.arange(0,2000,5),
+                            rtol : float = 1e-5, 
+                            atol : float = 1e-6,
+                            max_bounce : int = 1):
+        """
+        Propagate a ray from the transmitter to a look direction
+        transmit_lat : latitude of transmitter (deg)
+        transmit_lon : longitude of transmitter (deg)
+        transmit_alt : altitude of transmitter (m)
+        az : azimuth of look direction (deg)
+        el : elevation of look direction (deg)
+        f : frequency (Hz)
+        max_bounce : maximum number of 
+        """
+
+        bounce_init_lat = transmit_lat
+        bounce_init_lon = transmit_lon
+        bounce_init_alt = transmit_alt
+        bounce_init_az = az
+        bounce_init_el = el
+        bounce_init_range = group_path_distances[0]
+
+        end_path_range = group_path_distances[-1]
 
 
+        full_solution = lambda: None
+        full_solution.t = np.empty((0), dtype = float)
+        full_solution.y = np.empty((8,0), dtype = float)
+
+
+        # repeat raytracing for each ground bounce 
+        for bounce_ind in range(max_bounce+1):
+            
+            group_path_distance_for_bounce = group_path_distances[group_path_distances < end_path_range - bounce_init_range]
+            
+            # propagate ray 
+            solution = self.ray_propagate(bounce_init_lat, bounce_init_lon, bounce_init_alt, 
+                                      bounce_init_az, bounce_init_el, f, 
+                                      group_path_distances = group_path_distance_for_bounce, rtol = rtol, atol = atol)
+
+            # append ray state evaluations 
+            if len(solution.t) > 0:
+                full_solution.t = np.append(full_solution.t, solution.t + bounce_init_range)
+                full_solution.y = np.append(full_solution.y, solution.y, axis = 1)
+
+
+            if len(solution.t_events[0]) > 0:
+                # if the ray altitude is 0, reinitialize the ray state to "bounce away" from the ground 
+
+                # get the ray state as it hits the Earth surface
+                bounce_init_range = solution.t_events[0][0]
+                ray_state_at_bounce = solution.y_events[0][0]
+                r, theta, phi, kr, ktheta, kphi, P, s = ray_state_at_bounce
+
+                # convert to geodetic coordinates
+                x_ecef, y_ecef, z_ecef = GeoModel.convert_spherical_to_ecef(r, theta, phi)
+                bounce_init_lat, bounce_init_lon, bounce_init_alt = GeoModel.convert_ecef_to_lla(x_ecef, y_ecef, z_ecef)
+
+                # convert pointing to az el 
+                bounce_init_az, bounce_init_el = GeoModel.spherical_vector_azel(r, theta, phi, kr, ktheta, kphi)
+
+                # reflect elevation bounce to bounce back up
+                bounce_init_el = np.abs(bounce_init_el)
+
+            else:
+                # stop the loop is there is no ground bounce 
+                break
+    
+        return full_solution 
+    
     def ray_propagate(self, transmit_lat: np.float64, 
                             transmit_lon: np.float64,
                             transmit_alt: np.float64, 
@@ -205,30 +278,38 @@ class Raytracer():
         # initalize state vector
         x0 = [r, theta, phi, kr, ktheta, kphi, 0,0]
 
-        # if self.neutral is not None and self.iono is not None:
-        #     solution = odeint(self.derivatives, x0, group_path_distances, args=(f,), rtol=rtol, atol=atol, hmin =hmin)
-        # elif self.neutral is not None:
-        #     solution = odeint(self.derivatives_neutral, x0, group_path_distances, args=(f,), rtol=rtol, atol=atol, hmin =hmin)
-        # elif self.iono is not None:
-        #     solution = odeint(self.derivatives_ionosphere, x0, group_path_distances, args=(f,), rtol=rtol, atol=atol, hmin =hmin)
-
         t_span = [0, np.max(group_path_distances)]
 
-        if self.neutral is not None and self.iono is not None:
-            solution = solve_ivp(self.derivatives, t_span, x0, method = 'RK45',t_eval = group_path_distances, args=(f,), rtol = rtol, atol = atol)
-            # solution = solve_ivp(self.derivatives, t_span, x0, t_eval = group_path_distances, args=(f,))
+        event_func = self.get_geodetic_altitude
+        event_func.terminal = True
+        event_func.direction = -1 # only stop when decreasing altitude 
 
+        if self.neutral is not None and self.iono is not None:
+            # solution = solve_ivp(self.derivatives, t_span, x0, method = 'RK45',t_eval = group_path_distances, args=(f,), rtol = rtol, atol = atol)
+            solution = solve_ivp(self.derivatives, t_span, x0, method = 'LSODA',t_eval = group_path_distances, events = [event_func], args=(f,), rtol = rtol, atol = atol)
         elif self.neutral is not None:
             solution = solve_ivp(self.derivatives_neutral, t_span, x0,  method = 'RK45', t_eval = group_path_distances, args=(f,), rtol=rtol, atol=atol)
         elif self.iono is not None:
             solution = solve_ivp(self.derivatives_ionosphere, t_span, x0,  method = 'LSODA', t_eval = group_path_distances, args=(f,), rtol=rtol, atol=atol)
 
-
-
-        # elif self.iono is not None:
-        #     solution = odeint(self.derivatives_ionosphere, x0, group_path_distances, args=(f,), rtol=rtol, atol=atol, hmin =hmin)
+        # print failure message 
+        if solution.success is False:
+            print('ODE solver failed to converge')
+            print(solution.message)
+            return solution
 
         return solution
+    
+    @staticmethod 
+    def get_geodetic_altitude(t, y, f):
+        """
+        
+        """
+        r, theta, phi, kr, ktheta, kphi, P, s = y
+        # convert to geodetic coordinates
+        x_ecef, y_ecef, z_ecef = GeoModel.convert_spherical_to_ecef(r, theta, phi)
+        lat, lon, alt = GeoModel.convert_ecef_to_lla(x_ecef, y_ecef, z_ecef)
+        return alt
     
     def derivatives_neutral(self, Pgroup:np.float64, x:tuple[np.float64], f:np.float64):
         """
@@ -242,8 +323,6 @@ class Raytracer():
         omega = 2*np.pi*f 
 
         # calculate geodetic coordinates 
-        # x_ecef, y_ecef, z_ecef = GeoModel.convert_spherical_to_ecef(r, theta, phi)
-        # lat, lon, alt = GeoModel.convert_ecef_to_lla(x_ecef, y_ecef, z_ecef) # deg deg m 
         lat, lon, alt = GeoModel.convert_spherical_to_lla(r, theta, phi) # deg deg m
 
         # calculate index of refraction and spatial derivatives
@@ -270,11 +349,8 @@ class Raytracer():
 
         # get electron density 
         n_e, n_e_derivatives = self.iono(lat, lon, alt)
-
-        # # 
-        # omega0 = np.sqrt(n_e * const.e**2 / (const.epsilon_0 * const.m_e) )
-        # X = omega0**2/(omega**2) 
-
+        
+        # calculate hamiltonian derivatives
         deltaH_deltar, deltaH_deltatheta, deltaH_deltaphi, \
                 deltaH_deltaomega, \
                 deltaH_deltakr, deltaH_deltaktheta, deltaH_deltakphi = Raytracer.hamiltonian_ionosphere_no_field_no_collisions(x, f, n_e, n_e_derivatives)
@@ -300,8 +376,6 @@ class Raytracer():
 
         # unpack state space
         r, theta, phi, kr, ktheta, kphi, P, s = x
-
-
         lat, lon, alt = GeoModel.convert_spherical_to_lla(r, theta, phi) # deg deg m
 
         # TODO ADD REFLECTION AT EARTH SURFACE
@@ -309,37 +383,20 @@ class Raytracer():
         # if alt <=0:
         #     # TODO add reflection at earth surface 
             
+        #     # make the ray pointing up 
+        #     # kr = np.abs(kr)
+        #     x = [r, theta, phi, kr, ktheta, kphi, P, s]
+
         #     # convert to local elevaton and azimuth 
-        #     local_az, local_el = get_az_el_from_spherical_pointing(lat, lon alt, kr, ktheta, kphi) 
+        #     # local_az, local_el = GeoModel.spherical_vector_azel(r, theta, phi, kr, ktheta, kphi) 
 
-        #     # convert back to spherical coordinates
-        #     local_el = 90 - local_el
-        #     kr, ktheta, kphi = GeoModel.azel_to_spherical_vector(transmit_lat, transmit_lon, transmit_alt, az, el)
-        #     norm = np.sqrt(kr**2 + ktheta**2 + kphi**2)
-        #     kr = kr/norm * omega/const.c
-        #     ktheta = ktheta/norm *omega/const.c
-        #     kphi = kphi/norm *omega/const.c
-
-        #     pass 
-
-
-        # # calculate geodetic coordinates 
-        # x_ecef, y_ecef, z_ecef= GeoModel.convert_spherical_to_ecef(r, np.rad2deg(theta), 90 - np.rad2deg(phi))
-        # lat, lon, alt = GeoModel.convert_ecef_to_lla(x_ecef, y_ecef, z_ecef) # deg deg m 
-        
-
-
-        # omega = np.sqrt(const.c**2 * (kr**2 + ktheta**2 + kphi**2))
 
         if alt > 60e3:
             # get iono derivatives 
             derivatives = self.derivatives_ionosphere(Pgroup, x, f)
-
         else: 
             # neutral atmosphere case 
             derivatives = self.derivatives_neutral(Pgroup,x, f)
-
-        # derivatives = self.derivatives_ionosphere(Pgroup, x, f)
 
         # if alt > 50e3:
             # get iono derivatives 
