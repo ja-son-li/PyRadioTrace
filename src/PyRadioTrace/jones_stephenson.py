@@ -233,7 +233,7 @@ class Raytracer():
                 # convert pointing to az el 
                 bounce_init_az, bounce_init_el = GeoModel.spherical_vector_azel(r, theta, phi, kr, ktheta, kphi)
 
-                # reflect elevation bounce to bounce back up
+                # reflect elevation to bounce back up
                 bounce_init_el = np.abs(bounce_init_el)
 
             else:
