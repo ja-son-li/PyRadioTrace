@@ -33,11 +33,11 @@ class Raytracer():
                             receive_alt:np.float64, 
                             f : np.float64, 
                             resolution_m:np.float64 = 0.01,
-                            resolution_angle_deg = 0.1,
                             xatol = 1e-8,
                             rtol = 1e-5, 
                             atol = 1e-6,
-                            elevation_bounds = None) -> scipy.optimize.OptimizeResult:
+                            elevation_bounds = None,
+                            max_bounce = 1) -> scipy.optimize.OptimizeResult:
         """
         transmit_lat : latitude of transmitter (deg)
         transmit_lon : longitude of transmitter (deg)
@@ -48,7 +48,6 @@ class Raytracer():
         f : frequency (Hz)
         hmin : minimum step size of ODE solver (m)
         resolution_m : minimum interation difference for cost function(m)
-        resolution_angle_deg : minimum interation difference azimuth and elevation (deg)
         """
         
         # first guess 
@@ -67,7 +66,8 @@ class Raytracer():
                                                 receive_lat, receive_lon, receive_alt, 
                                                 az, el_guess, f, 
                                                 group_path_distances=group_path_distances, 
-                                                rtol=rtol, atol=atol)
+                                                rtol=rtol, atol=atol,
+                                                max_bounce=max_bounce)
         
         result = scipy.optimize.minimize_scalar(optimization_function, bounds = elevation_bounds, 
                                                                         method='bounded', 
@@ -83,9 +83,9 @@ class Raytracer():
                 receive_alt:np.float64, 
                 f : np.float64, 
                 resolution_m:np.float64 = 0.01,
-                resolution_angle_deg:np.float64 = 1e-3, 
                 rtol = 1e-5, 
-                atol = 1e-6) -> scipy.optimize.OptimizeResult:
+                atol = 1e-6,
+                max_bounce = 1) -> scipy.optimize.OptimizeResult:
         """
         transmit_lat : latitude of transmitter (deg)
         transmit_lon : longitude of transmitter (deg)
@@ -112,34 +112,18 @@ class Raytracer():
                                                 receive_lat, receive_lon, receive_alt, 
                                                 azel_guess[0], azel_guess[1], f, 
                                                 group_path_distances=group_path_distances, 
-                                                rtol=rtol, atol=atol)
-        # initial_simplex = np.array([[initial_guess[0], initial_guess[1]],
-        #                             [initial_guess[0], initial_guess[1] + resolution_angle_deg],
-        #                             [initial_guess[0], initial_guess[1] - resolution_angle_deg]])
+                                                rtol=rtol, atol=atol, max_bounce=max_bounce)
         
         result = scipy.optimize.minimize(optimization_function, initial_guess, method='Nelder-Mead', options={'fatol': resolution_m/10, 
                                                                                                               'maxiter':1e3,
                                                                                                               'disp': True})
-        # result = scipy.optimize.minimize(optimization_function, initial_guess, method='L-BFGS-B', options={'ftol': 1e-5, 
-        #                                                                                                       'maxiter':1e3,
-        #                                                                                                       'disp': True})
-        # result = scipy.optimize.minimize(optimization_function, initial_guess, method='BFGS', options={'fatol': resolution_m, 
-        #                                                                                                       'maxiter':1e3,
-        #                                                                                                       'disp': True})
-        
-        # result = scipy.optimize.minimize(optimization_function, initial_guess, method='Nelder-Mead')
-        # result = scipy.optimize.minimize(optimization_function, initial_guess)
-
-        # minimum = (result.x, result.fun, result.success, result.message)
-        # nelder mead simplex optimization for minimum distance 
-        # result = scipy.optimize.fmin(optimization_function, initial_guess,  xtol=resolution_angle_deg, ftol=resolution_m, disp=True)
-
         return result
 
     def ray_distance_to_target(self, transmit_lat:np.float64, transmit_lon:np.float64, transmit_alt:np.float64, 
                                     receiver_lat:np.float64, receiver_lon:np.float64, receiver_alt:np.float64,
                                     az:np.float64, el:np.float64, f:np.float64, 
-                                    group_path_distances:np.ndarray = np.arange(0,2000,5), rtol = 1e-3, atol = 1e-6) -> np.float64:
+                                    group_path_distances:np.ndarray = np.arange(0,2000,5), rtol = 1e-3, atol = 1e-6,
+                                    max_bounce = 1) -> np.float64:
         """
         INPUT:
         transmit_lat : latitude of transmitter (deg)
@@ -155,7 +139,18 @@ class Raytracer():
         OUTPUT:
         Minimum distance of ray to target (m)
         """
-        solution = self.ray_propagate(transmit_lat, transmit_lon, transmit_alt, az, el, f, group_path_distances = group_path_distances, atol = atol, rtol = rtol)
+
+        if max_bounce == 0:
+            solution = self.ray_propagate(transmit_lat, transmit_lon, transmit_alt,
+                                          az, el, f,
+                                          group_path_distances = group_path_distances,
+                                          atol = atol, rtol = rtol, stop_at_surface=False)
+        else:
+            solution = self.ray_propagate_with_bounce(transmit_lat, transmit_lon, transmit_alt,
+                                                      az, el, f,
+                                                      group_path_distances = group_path_distances,
+                                                      atol = atol, rtol = rtol,
+                                                      max_bounce = max_bounce)
 
         # convert geodetic coordinates to spherical coordinates
         x, y, z = GeoModel.convert_lla_to_ecef(receiver_lat, receiver_lon, receiver_alt)
@@ -233,6 +228,8 @@ class Raytracer():
                 # convert pointing to az el 
                 bounce_init_az, bounce_init_el = GeoModel.spherical_vector_azel(r, theta, phi, kr, ktheta, kphi)
 
+                kr = np.abs(kr) 
+
                 # reflect elevation to bounce back up
                 bounce_init_el = np.abs(bounce_init_el)
 
@@ -250,7 +247,8 @@ class Raytracer():
                             f : np.float64,
                             group_path_distances:np.ndarray = np.arange(0,2000,5),
                             rtol = 1e-5, 
-                            atol = 1e-6):
+                            atol = 1e-6,
+                            stop_at_surface= True):
         """
         Propagate a ray from the transmitter to a look direction
         transmit_lat : latitude of transmitter (deg)
@@ -280,9 +278,11 @@ class Raytracer():
 
         t_span = [0, np.max(group_path_distances)]
 
+        # set up ground bounce event 
         event_func = self.get_geodetic_altitude
-        event_func.terminal = True
+        event_func.terminal = stop_at_surface
         event_func.direction = -1 # only stop when decreasing altitude 
+
 
         if self.neutral is not None and self.iono is not None:
             # solution = solve_ivp(self.derivatives, t_span, x0, method = 'RK45',t_eval = group_path_distances, args=(f,), rtol = rtol, atol = atol)
@@ -361,50 +361,50 @@ class Raytracer():
                                             deltaH_deltakr, deltaH_deltaktheta, deltaH_deltakphi)
 
 
-    def derivatives(self, Pgroup:np.float64, x:np.ndarray, f:np.float64, o_mode = True):
+    def derivatives(self, Pgroup:np.float64, x:np.ndarray, f:np.float64):
         """
         derivative with respect to group path length
         x is state space
         f is center frequency (Hz) 
         """
-        # O mode 
-        if o_mode:
-            mode_sign = 1
-        else:
-            mode_sign = -1
-
+        omega = 2*np.pi*f 
 
         # unpack state space
         r, theta, phi, kr, ktheta, kphi, P, s = x
         lat, lon, alt = GeoModel.convert_spherical_to_lla(r, theta, phi) # deg deg m
 
-        # TODO ADD REFLECTION AT EARTH SURFACE
+        # get electron density 
+        n_e, n_e_derivatives = self.iono(lat, lon, alt)
 
-        # if alt <=0:
-        #     # TODO add reflection at earth surface 
-            
-        #     # make the ray pointing up 
-        #     # kr = np.abs(kr)
-        #     x = [r, theta, phi, kr, ktheta, kphi, P, s]
+        # get index of refraction 
+        n_refract, n_derivatives = self.neutral(lat, lon, alt)
 
-        #     # convert to local elevaton and azimuth 
-        #     # local_az, local_el = GeoModel.spherical_vector_azel(r, theta, phi, kr, ktheta, kphi) 
+        # calculate hamiltonian derivatives
+        iono_hamiltonian_derivatives = Raytracer.hamiltonian_ionosphere_no_field_no_collisions(x, f, n_e, n_e_derivatives)
+        neutral_hamiltonian_derivatives = Raytracer.hamiltonian_neutral_atmosphere(x, f, n_refract, n_derivatives)
+
+        # sum hamiltonian derivatives 
+        sum_hamiltonian_derivatives = tuple(x + y for x, y in zip(iono_hamiltonian_derivatives, neutral_hamiltonian_derivatives))
+        deltaH_deltar, deltaH_deltatheta, deltaH_deltaphi, \
+                        deltaH_deltaomega, \
+                        deltaH_deltakr, deltaH_deltaktheta, deltaH_deltakphi = sum_hamiltonian_derivatives
+        
+        # if alt > 60e3:
+        #     # get iono derivatives 
+        #     derivatives = self.derivatives_ionosphere(Pgroup, x, f)
+        # else: 
+        #     # neutral atmosphere case 
+        #     derivatives = self.derivatives_neutral(Pgroup,x, f)
+
+        # return derivatives
+
+        
+        return Raytracer.group_path_derivatives(x, omega, 
+                                            deltaH_deltar, deltaH_deltatheta, deltaH_deltaphi, 
+                                            deltaH_deltaomega, 
+                                            deltaH_deltakr, deltaH_deltaktheta, deltaH_deltakphi)
 
 
-        if alt > 60e3:
-            # get iono derivatives 
-            derivatives = self.derivatives_ionosphere(Pgroup, x, f)
-        else: 
-            # neutral atmosphere case 
-            derivatives = self.derivatives_neutral(Pgroup,x, f)
-
-        # if alt > 50e3:
-            # get iono derivatives 
-        # derivatives_iono = self.derivatives_ionosphere(x, Pgroup, f)
-        # derivatives_neutral = self.derivatives_neutral(x, Pgroup, f)
-        # derivatives = tuple(map(sum,zip(derivatives_iono,derivatives_neutral)))
-
-        return derivatives
     
     @staticmethod
     @jit(nopython=True)
