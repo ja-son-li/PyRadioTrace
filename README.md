@@ -10,7 +10,7 @@ Atmospheric and Ionospheric raytracing
 
    ``cd PyRadioTrace``
    
-   ``pip intall -e .`` 
+   ``pip install -e .`` 
 
 ### General Use
 1. Defining enviromental model functions
